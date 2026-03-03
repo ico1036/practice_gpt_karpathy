@@ -139,7 +139,58 @@ The 4-way ablation reveals that the scratchpad benefit is **compute-driven, not 
 
 3. **It's extra compute**: Each additional token provides an extra forward pass through the attention mechanism. Subsequent tokens can attend to the computed hidden state of the scratchpad token, giving the model more sequential computation before committing to an answer. The content of that computation doesn't matter — just having *any* token there creates a richer attention context.
 
-This is the same principle behind Chain-of-Thought at scale (more tokens = more sequential computation = better answers), but at this 5,952-parameter scale, we can prove it's a **compute effect** rather than **emergent reasoning**. The model learned to use `|` as a "compute buffer" — not to think, but to buy itself an extra forward pass. True content-dependent reasoning likely requires more model capacity.
+### Two Layers of CoT
+
+Our experiment decomposes Chain-of-Thought into two distinct mechanisms:
+
+```
+Layer 1: Extra Compute
+  └─ More tokens → more forward passes → deeper computation graph
+  └─ Content-independent: any token (even random) provides the benefit
+  └─ This is what our 5,952-param model uses
+
+Layer 2: Meaningful Intermediate Reasoning
+  └─ Tokens encode actual logical steps (e.g. "3×7=21, 21+4=25")
+  └─ Content-dependent: replacing scratchpad content should degrade accuracy
+  └─ NOT observed at this scale
+```
+
+At 5,952 parameters, only Layer 1 is active. The model uses `|` as a **compute buffer** — not to think, but to buy itself an extra forward pass.
+
+### Alignment with Recent Research
+
+Our micro-scale finding is consistent with several lines of active research:
+
+**CoT emergence threshold.** The original CoT paper ([Wei et al., 2022](https://arxiv.org/abs/2201.11903)) found that CoT prompting only helps at ~100B parameters. Below that, generated reasoning chains are "fluent but illogical" and actually hurt performance. Our model is ~17 million times smaller than this threshold — the absence of content-dependent reasoning is expected.
+
+**RLVR debate (2025).** Whether RLVR creates genuinely new reasoning or just amplifies existing base model capabilities remains contested:
+- Skeptical: [NeurIPS 2025 Oral](https://openreview.net/forum?id=4OsgYD7em5) — "All correct reasoning paths in the RL-trained model already exist in the base model's distribution." RLVR improves sampling efficiency, not reasoning capacity.
+- Affirmative: [arxiv 2506.14245](https://arxiv.org/abs/2506.14245) — RLVR incentivizes correct reasoning early in training and extends reasoning boundaries.
+
+**Coconut: Pause tokens vs latent reasoning.** Meta's [Coconut](https://arxiv.org/abs/2412.06769) (Chain of Continuous Thought) tested exactly our question at larger scale. They compared:
+
+| Method | Description | Result |
+|--------|-------------|--------|
+| CoT (text) | Reason in token space | Baseline |
+| **Pause tokens** | Insert `<pause>`, no content | Helps, but limited |
+| **Coconut** | Feed hidden states back as input | Better than CoT |
+
+Their "pause token" is essentially our random scratchpad — extra compute without meaningful content. Like us, they found it helps but falls short of true reasoning. Real gains came from **latent reasoning** in continuous hidden-state space, not discrete token generation.
+
+**Distillation changes the picture.** [DeepSeek-R1](https://arxiv.org/abs/2501.12948) showed that a 1.5B distilled model can outperform GPT-4o on math benchmarks. But this transfers reasoning from a much larger teacher — the small model doesn't discover CoT on its own.
+
+### What We Proved vs What Remains Open
+
+**Proven:**
+- Extra tokens help at any scale (compute effect) — confirmed by our ablation and Meta's pause token experiments
+- At 5,952 params, scratchpad content is interchangeable with random tokens
+- The model learns to use `|` more over training (54% → 74%), but as a compute buffer, not a reasoning space
+
+**Open questions:**
+1. **Where is the threshold?** Between 5,952 params and ~100B, there exists a scale where Layer 2 (content-dependent reasoning) activates. The exact boundary is unknown — distillation puts it as low as 1.5B, but emergent discovery may require more.
+2. **Depth vs width?** Our model has 1 layer. More layers = more sequential computation depth. The transition from compute-only to content-dependent might depend more on depth than total parameter count.
+3. **Task structure?** Name completion may not benefit from decomposition. A task with clear multi-step structure (e.g. arithmetic) might elicit content-dependent scratchpad use even at smaller scale.
+4. **Latent reasoning?** Coconut-style hidden-state reasoning (instead of discrete token scratchpad) might enable meaningful intermediate computation at smaller scales — the reasoning stays in continuous space rather than being bottlenecked through a discrete vocabulary.
 
 ## Usage
 
@@ -157,3 +208,6 @@ uv run python microgpt_rlvr.py       # MQA + MoE + RLVR
 - MoE: [Outrageously Large Neural Networks (Shazeer et al., 2017)](https://arxiv.org/abs/1701.06538)
 - RLVR/GRPO: [DeepSeekMath (Shao et al., 2024)](https://arxiv.org/abs/2402.03300)
 - CoT emergence: [DeepSeek-R1 (Guo et al., 2025)](https://arxiv.org/abs/2501.12948)
+- CoT prompting: [Chain-of-Thought Prompting (Wei et al., 2022)](https://arxiv.org/abs/2201.11903)
+- RLVR limits: [Does RL Really Incentivize Reasoning? (NeurIPS 2025)](https://openreview.net/forum?id=4OsgYD7em5)
+- Latent reasoning: [Coconut — Reasoning in Continuous Latent Space (Meta, 2024)](https://arxiv.org/abs/2412.06769)
