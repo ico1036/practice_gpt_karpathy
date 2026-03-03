@@ -1,16 +1,19 @@
 """
-microGPT with MQA + MoE + RLVR (Reinforcement Learning with Verifiable Rewards)
-Phase 1: SFT pre-training on names dataset (1000 steps)
-Phase 2: RLVR fine-tuning with REINFORCE + group baseline (300 steps)
+microGPT with MQA + MoE + RLVR — Scratchpad Ablation Test
 
-Verifiable task: generate names that are exactly 5 chars and end with 'a'
+Train ONE model: SFT → Cold Start → RLVR (scratchpad verifier)
+Evaluate SAME model with TWO inference modes:
+  Eval A: | token blocked (logit=-inf) → forced direct answer
+  Eval B: natural generation → model decides whether to use |
+Plus post-hoc analysis: accuracy of |-using vs non-| samples within Eval B.
+
+If B > A → model productively uses scratchpad → micro-CoT evidence.
 """
 
 import os
 import math
 import random
 import time
-import copy
 
 random.seed(42)
 
@@ -24,9 +27,14 @@ random.shuffle(docs)
 print(f"num docs: {len(docs)}")
 
 uchars = sorted(set(''.join(docs)))
-BOS = len(uchars)
-vocab_size = len(uchars) + 1
-print(f"vocab size: {vocab_size}")
+BOS = len(uchars)        # 26
+SEP = len(uchars) + 1    # 27
+vocab_size = len(uchars) + 2  # 28
+print(f"vocab size: {vocab_size} (| = {SEP})")
+
+name_set = set(docs)
+prefixes = list(set(name[:2] for name in docs if len(name) >= 3))
+print(f"unique 2-char prefixes: {len(prefixes)}")
 
 class Value:
     __slots__ = ('data', 'grad', '_children', '_local_grads')
@@ -107,7 +115,6 @@ expert_mult = 2
 
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
 
-# --- Model weights (MQA + MoE) ---
 state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
 
 for i in range(n_layer):
@@ -121,7 +128,7 @@ for i in range(n_layer):
         state_dict[f'layer{i}.expert{e}.fc2'] = matrix(n_embd, expert_mult * n_embd)
 
 params = [p for mat in state_dict.values() for row in mat for p in row]
-print(f"[RLVR] total params: {len(params)}")
+print(f"total params: {len(params)}")
 
 def linear(x, w):
     return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
@@ -143,7 +150,6 @@ def moe_mlp(x, layer_idx):
     indexed.sort(key=lambda t: t[0].data, reverse=True)
     top_experts = indexed[:top_k]
     gate_weights = softmax([t[0] for t in top_experts])
-
     combined = [Value(0.0) for _ in range(n_embd)]
     for (_, expert_id), gw in zip(top_experts, gate_weights):
         h = linear(x, state_dict[f'layer{layer_idx}.expert{expert_id}.fc1'])
@@ -158,7 +164,6 @@ def gpt(token_id, pos_id, keys, values):
     pos_emb = state_dict['wpe'][pos_id]
     x = [t + p for t, p in zip(tok_emb, pos_emb)]
     x = rmsnorm(x)
-
     for li in range(n_layer):
         x_residual = x
         x = rmsnorm(x)
@@ -167,7 +172,6 @@ def gpt(token_id, pos_id, keys, values):
         v = linear(x, state_dict[f'layer{li}.attn_wv'])
         keys[li].append(k)
         values[li].append(v)
-
         x_attn = []
         for h in range(n_head):
             hs = h * head_dim
@@ -176,210 +180,308 @@ def gpt(token_id, pos_id, keys, values):
             attn_weights = softmax(attn_logits)
             head_out = [sum(attn_weights[t] * values[li][t][j] for t in range(len(values[li]))) for j in range(head_dim)]
             x_attn.extend(head_out)
-
         x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
         x = [a + b for a, b in zip(x, x_residual)]
-
         x_residual = x
         x = rmsnorm(x)
         x = moe_mlp(x, li)
         x = [a + b for a, b in zip(x, x_residual)]
-
     logits = linear(x, state_dict['lm_head'])
     return logits
 
 # ============================================================
-# Phase 1: SFT Pre-training
+# Helpers
+# ============================================================
+
+def fmt(gen):
+    return ''.join('|' if t == SEP else uchars[t] if t < len(uchars) else '?' for t in gen)
+
+def verifier(prompt_str, generated):
+    """Scratchpad-aware verifier: only post-| tokens are the answer."""
+    if SEP in generated:
+        answer = generated[generated.index(SEP) + 1:]
+    else:
+        answer = generated
+    for t in answer:
+        if t >= len(uchars):
+            return 0.0
+    if not answer:
+        return 0.0
+    return 1.0 if (prompt_str + ''.join(uchars[t] for t in answer)) in name_set else 0.0
+
+def generate(prompt_str, temperature=1.0, collect_grad=True, block_sep=False):
+    """Generate from prompt. block_sep=True sets | logit to -inf."""
+    prompt_tokens = [BOS] + [uchars.index(ch) for ch in prompt_str]
+    keys_g, values_g = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
+    generated, log_probs = [], []
+
+    token_id = prompt_tokens[0]
+    for pos_id in range(block_size):
+        logits = gpt(token_id, pos_id, keys_g, values_g)
+        if pos_id < len(prompt_tokens) - 1:
+            token_id = prompt_tokens[pos_id + 1]
+        else:
+            adj_logits = [l / temperature for l in logits]
+            if block_sep:
+                adj_logits[SEP] = adj_logits[SEP] + Value(-100.0)
+            probs = softmax(adj_logits)
+            token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
+            if token_id == BOS:
+                break
+            if collect_grad:
+                log_probs.append(probs[token_id].log())
+            generated.append(token_id)
+    return generated, log_probs
+
+# ============================================================
+# Training
 # ============================================================
 learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
-m_adam = [0.0] * len(params)
-v_adam = [0.0] * len(params)
 
-sft_steps = 1000
-print(f"\n[Phase 1] SFT pre-training for {sft_steps} steps...")
-sft_start = time.time()
+def adam_step(m_a, v_a, step, lr):
+    for i, p in enumerate(params):
+        m_a[i] = beta1 * m_a[i] + (1 - beta1) * p.grad
+        v_a[i] = beta2 * v_a[i] + (1 - beta2) * p.grad ** 2
+        m_hat = m_a[i] / (1 - beta1 ** (step + 1))
+        v_hat = v_a[i] / (1 - beta2 ** (step + 1))
+        p.data -= lr * m_hat / (v_hat ** 0.5 + eps_adam)
+        p.grad = 0
 
-for step in range(sft_steps):
+# --- Phase 1: SFT ---
+print(f"\n{'='*60}")
+print("Phase 1: SFT (1000 steps)")
+print(f"{'='*60}")
+m_a, v_a = [0.0]*len(params), [0.0]*len(params)
+t0 = time.time()
+for step in range(1000):
     doc = docs[step % len(docs)]
     tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
     n = min(block_size, len(tokens) - 1)
-
     keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
     losses = []
-
     for pos_id in range(n):
-        token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
-        logits = gpt(token_id, pos_id, keys, values)
+        logits = gpt(tokens[pos_id], pos_id, keys, values)
         probs = softmax(logits)
-        loss_t = -probs[target_id].log()
-        losses.append(loss_t)
-
-    loss = (1 / n) * sum(losses)
+        losses.append(-probs[tokens[pos_id+1]].log())
+    loss = (1/n) * sum(losses)
     loss.backward()
+    adam_step(m_a, v_a, step, learning_rate * (1 - step/1000))
+    if (step+1) % 200 == 0 or step == 0:
+        print(f"  step {step+1:4d} | loss {loss.data:.4f}")
+print(f"  SFT done in {time.time()-t0:.1f}s")
 
-    lr_t = learning_rate * (1 - step / sft_steps)
-    for i, p in enumerate(params):
-        m_adam[i] = beta1 * m_adam[i] + (1 - beta1) * p.grad
-        v_adam[i] = beta2 * v_adam[i] + (1 - beta2) * p.grad ** 2
-        m_hat = m_adam[i] / (1 - beta1 ** (step + 1))
-        v_hat = v_adam[i] / (1 - beta2 ** (step + 1))
-        p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
-        p.grad = 0
+# --- Phase 2: Cold Start ---
+print(f"\n{'='*60}")
+print("Phase 2: Cold Start — teach | format (100 steps)")
+print(f"{'='*60}")
+cold_data = []
+for _ in range(500):
+    name = random.choice([n for n in docs if len(n) >= 3])
+    scratch = [random.randint(0, len(uchars)-1) for _ in range(random.randint(1, 3))]
+    tokens = [BOS] + [uchars.index(c) for c in name[:2]] + scratch + [SEP] + [uchars.index(c) for c in name[2:]] + [BOS]
+    if len(tokens) <= block_size + 1:
+        cold_data.append(tokens)
 
-    if (step + 1) % 100 == 0 or step == 0:
-        print(f"  step {step+1:4d} / {sft_steps:4d} | loss {loss.data:.4f}")
+m_a, v_a = [0.0]*len(params), [0.0]*len(params)
+t0 = time.time()
+for step in range(100):
+    tokens = cold_data[step % len(cold_data)]
+    n = min(block_size, len(tokens) - 1)
+    keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
+    losses = []
+    for pos_id in range(n):
+        logits = gpt(tokens[pos_id], pos_id, keys, values)
+        probs = softmax(logits)
+        losses.append(-probs[tokens[pos_id+1]].log())
+    loss = (1/n) * sum(losses)
+    loss.backward()
+    adam_step(m_a, v_a, step, 0.005)
+    if (step+1) % 25 == 0 or step == 0:
+        print(f"  step {step+1:4d} | loss {loss.data:.4f}")
+print(f"  Cold start done in {time.time()-t0:.1f}s")
 
-sft_elapsed = time.time() - sft_start
-print(f"[Phase 1] SFT done in {sft_elapsed:.1f}s")
-
-# --- Evaluate pre-RLVR ---
-def verifier(name):
-    """Verifiable reward: name is exactly 5 chars and ends with 'a'"""
-    if len(name) == 5 and len(name) > 0 and name[-1] == 'a':
-        return 1.0
-    return 0.0
-
-def sample_names(n_samples, temperature=0.5):
-    """Generate names and return (names, rewards)"""
-    names = []
-    for _ in range(n_samples):
-        keys_g = [[] for _ in range(n_layer)]
-        values_g = [[] for _ in range(n_layer)]
-        token_id = BOS
-        name_chars = []
-        for pos_id in range(block_size):
-            logits = gpt(token_id, pos_id, keys_g, values_g)
-            probs = softmax([l / temperature for l in logits])
-            token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
-            if token_id == BOS:
-                break
-            name_chars.append(uchars[token_id])
-        names.append(''.join(name_chars))
-    rewards = [verifier(n) for n in names]
-    return names, rewards
-
-print("\n[Pre-RLVR] Sampling 50 names...")
-pre_names, pre_rewards = sample_names(50)
-pre_rate = sum(pre_rewards) / len(pre_rewards) * 100
-print(f"  Verifier pass rate: {pre_rate:.0f}% ({int(sum(pre_rewards))}/50)")
-print(f"  Samples: {pre_names[:10]}")
-matching = [n for n in pre_names if verifier(n) == 1.0]
-print(f"  Matching names: {matching[:10]}")
-
-# ============================================================
-# Phase 2: RLVR with REINFORCE + Group Baseline
-# ============================================================
+# --- Phase 3: RLVR ---
+print(f"\n{'='*60}")
+print("Phase 3: RLVR with scratchpad verifier (500 steps)")
+print(f"{'='*60}")
+G = 4
 rlvr_lr = 0.003
-rlvr_steps = 300
-G = 4  # group size (completions per step)
+m_a, v_a = [0.0]*len(params), [0.0]*len(params)
+t0 = time.time()
+reward_hist, sep_hist = [], []
 
-# Reset Adam state for RLVR phase
-m_adam = [0.0] * len(params)
-v_adam = [0.0] * len(params)
-
-print(f"\n[Phase 2] RLVR fine-tuning for {rlvr_steps} steps (G={G})...")
-print(f"  Task: generate names that are exactly 5 chars and end with 'a'")
-rlvr_start = time.time()
-
-reward_history = []
-
-for step in range(rlvr_steps):
-    # --- Sample G completions with log_probs (autograd on) ---
-    group_log_probs = []
-    group_rewards = []
-    group_names = []
+for step in range(500):
+    prompt_str = random.choice(prefixes)
+    g_lps, g_rewards, g_outs, step_sep = [], [], [], 0
 
     for g in range(G):
-        keys_g = [[] for _ in range(n_layer)]
-        values_g = [[] for _ in range(n_layer)]
-        token_id = BOS
-        name_chars = []
-        log_probs_seq = []
+        gen, lps = generate(prompt_str, temperature=1.5, collect_grad=True)
+        r = verifier(prompt_str, gen)
+        g_lps.append(lps)
+        g_rewards.append(r)
+        g_outs.append(f"{prompt_str}+{fmt(gen)}")
+        if SEP in gen:
+            step_sep += 1
 
-        for pos_id in range(block_size):
-            logits = gpt(token_id, pos_id, keys_g, values_g)
-            probs = softmax(logits)
+    mean_r = sum(g_rewards) / G
+    std_r = (sum((r-mean_r)**2 for r in g_rewards) / G) ** 0.5
+    reward_hist.append(mean_r)
+    sep_hist.append(step_sep / G)
 
-            # Sample token
-            token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
-
-            if token_id == BOS:
-                break
-
-            # Collect log_prob of chosen token (connected to params via autograd)
-            log_probs_seq.append(probs[token_id].log())
-            name_chars.append(uchars[token_id])
-
-        name = ''.join(name_chars)
-        reward = verifier(name)
-        group_log_probs.append(log_probs_seq)
-        group_rewards.append(reward)
-        group_names.append(name)
-
-    # --- Group-normalized advantage (GRPO-style baseline) ---
-    mean_r = sum(group_rewards) / G
-    var_r = sum((r - mean_r) ** 2 for r in group_rewards) / G
-    std_r = var_r ** 0.5
-
-    reward_history.append(mean_r)
-
-    # Skip update if no reward variance (all same reward → no signal)
     if std_r < 1e-8:
         for p in params:
             p.grad = 0
-        if (step + 1) % 50 == 0 or step == 0:
-            print(f"  step {step+1:4d} / {rlvr_steps:4d} | mean_r {mean_r:.2f} | (skipped, no variance)")
+        if (step+1) % 100 == 0 or step == 0:
+            print(f"  step {step+1:4d} | r={mean_r:.2f} | sep={step_sep/G:.0%} | (skip) | {g_outs[0]}")
         continue
 
-    advantages = [(r - mean_r) / std_r for r in group_rewards]
-
-    # --- REINFORCE loss: -sum(log_prob * advantage) ---
+    advs = [(r-mean_r)/std_r for r in g_rewards]
     loss = Value(0.0)
-    total_tokens = 0
+    tot = 0
     for g in range(G):
-        if len(group_log_probs[g]) > 0:
-            seq_lp = sum(group_log_probs[g])
-            loss = loss + (seq_lp * (-advantages[g]))
-            total_tokens += len(group_log_probs[g])
-
-    if total_tokens > 0:
-        loss = loss * (1.0 / total_tokens)
+        if g_lps[g]:
+            loss = loss + sum(g_lps[g]) * (-advs[g])
+            tot += len(g_lps[g])
+    if tot > 0:
+        loss = loss * (1.0/tot)
         loss.backward()
+        adam_step(m_a, v_a, step, rlvr_lr * (1 - step/500))
 
-        lr_t = rlvr_lr * (1 - step / rlvr_steps)
-        for i, p in enumerate(params):
-            m_adam[i] = beta1 * m_adam[i] + (1 - beta1) * p.grad
-            v_adam[i] = beta2 * v_adam[i] + (1 - beta2) * p.grad ** 2
-            m_hat = m_adam[i] / (1 - beta1 ** (step + 1))
-            v_hat = v_adam[i] / (1 - beta2 ** (step + 1))
-            p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
-            p.grad = 0
+    if (step+1) % 100 == 0 or step == 0:
+        rr = sum(reward_hist[-100:])/len(reward_hist[-100:])
+        sr = sum(sep_hist[-100:])/len(sep_hist[-100:])
+        print(f"  step {step+1:4d} | r={mean_r:.2f} | avg={rr:.3f} | sep={sr:.0%} | {g_outs[:2]}")
 
-    if (step + 1) % 50 == 0 or step == 0:
-        recent_r = sum(reward_history[-50:]) / len(reward_history[-50:])
-        print(f"  step {step+1:4d} / {rlvr_steps:4d} | mean_r {mean_r:.2f} | recent_avg {recent_r:.3f} | names: {group_names}")
-
-rlvr_elapsed = time.time() - rlvr_start
-print(f"[Phase 2] RLVR done in {rlvr_elapsed:.1f}s")
+rlvr_time = time.time() - t0
+print(f"  RLVR done in {rlvr_time:.1f}s")
 
 # ============================================================
-# Post-RLVR Evaluation
+# EVALUATION — Same model, same prompts, two inference modes
 # ============================================================
-print("\n[Post-RLVR] Sampling 50 names...")
-post_names, post_rewards = sample_names(50)
-post_rate = sum(post_rewards) / len(post_rewards) * 100
-print(f"  Verifier pass rate: {post_rate:.0f}% ({int(sum(post_rewards))}/50)")
-print(f"  Samples: {post_names[:10]}")
-matching = [n for n in post_names if verifier(n) == 1.0]
-print(f"  Matching names: {matching[:10]}")
+print(f"\n{'='*60}")
+print("ABLATION TEST: Same model, same 200 prompts")
+print(f"{'='*60}")
 
-# --- Summary ---
-print("\n" + "=" * 50)
-print("[RLVR Summary]")
-print(f"  Task: 5-char names ending with 'a'")
-print(f"  Pre-RLVR pass rate:  {pre_rate:.0f}%")
-print(f"  Post-RLVR pass rate: {post_rate:.0f}%")
-print(f"  SFT time:  {sft_elapsed:.1f}s")
-print(f"  RLVR time: {rlvr_elapsed:.1f}s")
-print(f"  Total time: {sft_elapsed + rlvr_elapsed:.1f}s")
-print("=" * 50)
+eval_prefixes = random.sample(prefixes, min(200, len(prefixes)))
+
+# --- Eval A: | blocked ---
+print("\n[Eval A] | token BLOCKED (logit = -inf)...")
+a_correct, a_total = 0, 0
+a_examples = []
+for pf in eval_prefixes:
+    gen, _ = generate(pf, temperature=0.5, collect_grad=False, block_sep=True)
+    r = verifier(pf, gen)
+    a_total += 1
+    if r > 0:
+        a_correct += 1
+    if len(a_examples) < 10:
+        a_examples.append(f"  {pf}+{fmt(gen)} → {'✓' if r>0 else '✗'}")
+acc_a = a_correct / a_total * 100
+print(f"  Accuracy: {acc_a:.1f}% ({a_correct}/{a_total})")
+for ex in a_examples[:5]:
+    print(ex)
+
+# --- Eval B: natural (| allowed) ---
+print("\n[Eval B] Natural generation (| allowed)...")
+b_correct, b_total = 0, 0
+b_with_sep_correct, b_with_sep_total = 0, 0
+b_no_sep_correct, b_no_sep_total = 0, 0
+b_scratch_lens = []
+b_examples_hit, b_examples_miss = [], []
+
+for pf in eval_prefixes:
+    gen, _ = generate(pf, temperature=0.5, collect_grad=False, block_sep=False)
+    r = verifier(pf, gen)
+    b_total += 1
+    used_sep = SEP in gen
+
+    if r > 0:
+        b_correct += 1
+
+    if used_sep:
+        b_with_sep_total += 1
+        b_scratch_lens.append(gen.index(SEP))
+        if r > 0:
+            b_with_sep_correct += 1
+    else:
+        b_no_sep_total += 1
+        if r > 0:
+            b_no_sep_correct += 1
+
+    tag = '✓' if r > 0 else '✗'
+    if r > 0 and len(b_examples_hit) < 10:
+        b_examples_hit.append(f"  {pf}+{fmt(gen)} → {tag}")
+    elif r == 0 and len(b_examples_miss) < 5:
+        b_examples_miss.append(f"  {pf}+{fmt(gen)} → {tag}")
+
+acc_b = b_correct / b_total * 100
+sep_rate = b_with_sep_total / b_total * 100
+print(f"  Accuracy: {acc_b:.1f}% ({b_correct}/{b_total})")
+print(f"  | usage: {sep_rate:.1f}% ({b_with_sep_total}/{b_total})")
+if b_scratch_lens:
+    print(f"  Avg scratch length: {sum(b_scratch_lens)/len(b_scratch_lens):.1f}")
+print(f"\n  Correct samples:")
+for ex in b_examples_hit[:8]:
+    print(ex)
+print(f"  Wrong samples:")
+for ex in b_examples_miss[:3]:
+    print(ex)
+
+# --- Post-hoc: within Eval B, compare | vs no-| accuracy ---
+acc_with = b_with_sep_correct / b_with_sep_total * 100 if b_with_sep_total > 0 else 0
+acc_without = b_no_sep_correct / b_no_sep_total * 100 if b_no_sep_total > 0 else 0
+
+# ============================================================
+# FINAL RESULTS
+# ============================================================
+print(f"\n{'='*60}")
+print("FINAL RESULTS")
+print(f"{'='*60}")
+print(f"  Training: SFT(1000) → Cold Start(100) → RLVR(500)")
+print(f"  Task: 2-char prefix → real name ∈ dataset ({len(name_set)} names)")
+print()
+print(f"  ┌─────────────────────────────────────────────┐")
+print(f"  │ Ablation Test (same model, same prompts)    │")
+print(f"  │                                             │")
+print(f"  │  Eval A (| blocked):  {acc_a:5.1f}% accuracy       │")
+print(f"  │  Eval B (| allowed):  {acc_b:5.1f}% accuracy       │")
+delta = acc_b - acc_a
+sign = '+' if delta >= 0 else ''
+print(f"  │  Delta:              {sign}{delta:5.1f}%p              │")
+print(f"  │                                             │")
+print(f"  │ Post-hoc (within Eval B):                   │")
+print(f"  │  With |:    {acc_with:5.1f}% ({b_with_sep_correct}/{b_with_sep_total} samples)          │")
+print(f"  │  Without |: {acc_without:5.1f}% ({b_no_sep_correct}/{b_no_sep_total} samples)          │")
+print(f"  │  | usage:   {sep_rate:5.1f}%                        │")
+print(f"  └─────────────────────────────────────────────┘")
+print()
+if delta > 3:
+    print(f"  ✓ Removing | drops accuracy by {abs(delta):.1f}%p")
+    print(f"    → Model was using scratchpad productively")
+    if b_with_sep_total > 5 and acc_with > acc_without + 5:
+        print(f"  ✓ |-using samples ({acc_with:.0f}%) outperform non-| ({acc_without:.0f}%)")
+        print(f"    → Scratchpad usage correlates with correctness")
+        print(f"  ✓ CONCLUSION: Evidence of learned intermediate computation")
+    elif b_with_sep_total > 5:
+        print(f"  △ |-using ({acc_with:.0f}%) vs non-| ({acc_without:.0f}%) — mixed signal")
+    else:
+        print(f"  △ Too few | samples ({b_with_sep_total}) for post-hoc analysis")
+elif delta < -3:
+    print(f"  ✗ | hurts accuracy by {abs(delta):.1f}%p — scratchpad is harmful")
+else:
+    print(f"  ─ No significant difference ({delta:+.1f}%p)")
+    if b_with_sep_total > 5 and acc_with > acc_without + 10:
+        print(f"  △ But within Eval B, |-users ({acc_with:.0f}%) > non-users ({acc_without:.0f}%)")
+        print(f"    → Model may benefit from | on certain prompts")
+
+# | usage trend during RLVR
+early = sum(sep_hist[:50])/50
+late = sum(sep_hist[-50:])/50
+print(f"\n  RLVR | usage: early={early:.0%} → late={late:.0%}", end='')
+if late > early + 0.05:
+    print(" (increasing ↑)")
+elif late < early - 0.05:
+    print(" (decreasing ↓)")
+else:
+    print(" (stable)")
+print(f"{'='*60}")

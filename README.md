@@ -44,29 +44,32 @@ MoE:         x → Router → top-2 of 4 experts
 - Softmax over top-2 gate scores determines mixing weights
 - Active compute per token stays similar, but total model capacity increases
 
-### MoE + RLVR (`microgpt_rlvr.py`)
+### MoE + RLVR with Scratchpad (`microgpt_rlvr.py`)
 
-RLVR (Reinforcement Learning with Verifiable Rewards) adds a post-SFT fine-tuning phase using policy gradients with a rule-based verifier instead of human feedback.
+RLVR (Reinforcement Learning with Verifiable Rewards) adds a post-SFT fine-tuning phase using REINFORCE with a verifiable reward function. This implementation includes a **scratchpad mechanism** to test emergent intermediate computation (micro-scale Chain-of-Thought).
 
 ```
-Phase 1 (SFT):  standard next-token prediction on names (1000 steps)
-Phase 2 (RLVR): REINFORCE with group baseline (300 steps, G=4)
-  1. Sample G=4 names from the policy
-  2. Score each with verifier: reward ∈ {0, 1}
-  3. Group-normalized advantage: A_i = (r_i - mean) / std
-  4. Loss = -Σ log_prob(token) × advantage
-  5. Backward + Adam update
+Phase 1 (SFT):        next-token prediction on names (1000 steps)
+Phase 2 (Cold Start):  teach | separator format with random scratchpad (100 steps)
+Phase 3 (RLVR):        REINFORCE + group baseline (500 steps, G=4)
 ```
 
-- Verifiable task: "generate a name that is exactly 5 characters and ends with 'a'"
-- No learned reward model, no human labels — just a Python function
-- GRPO-style group baseline eliminates the need for a critic network
+**Scratchpad design:** A `|` separator token is added to the vocabulary. The model can optionally generate tokens before `|` (scratchpad) — only tokens after `|` are evaluated by the verifier. The model decides whether and when to use `|`.
+
+```
+Without scratchpad:  "an" → "na"           → verify "anna" ∈ dataset
+With scratchpad:     "an" → "l|na"         → ignore "l", verify "anna" ∈ dataset
+                            ^^^              ^^
+                         scratchpad        answer only
+```
+
+- Verifiable task: given 2-char prefix, complete to a real name in the dataset
+- Cold start teaches the FORMAT only (random scratchpad content) — not HOW to think
+- RLVR then determines whether using scratchpad actually improves accuracy
 
 ## Results
 
 ### Architecture Comparison (SFT only)
-
-All models trained on the [names dataset](https://github.com/karpathy/makemore) for 1000 steps with identical hyperparameters (`n_embd=16, n_head=4, n_layer=1, block_size=16, lr=0.01`).
 
 All models trained on the [names dataset](https://github.com/karpathy/makemore) for 1000 steps with identical hyperparameters (`n_embd=16, n_head=4, n_layer=1, block_size=16, lr=0.01`).
 
@@ -92,20 +95,40 @@ All models trained on the [names dataset](https://github.com/karpathy/makemore) 
 
 **MoE**: karan, meeran, kana, seane, maran, laelin, alenan, dane, arel, ladid
 
-### RLVR Results (Post-SFT Fine-tuning)
+### RLVR Scratchpad Ablation Test
 
-Task: generate names that are exactly 5 characters long and end with 'a'.
+**Experiment:** Train ONE model (SFT → Cold Start → RLVR), then evaluate with two inference modes on the same 200 prompts:
 
-| Metric | Pre-RLVR (SFT only) | Post-RLVR |
-|--------|---------------------|-----------|
-| Verifier pass rate | 14% (7/50) | **98%** (49/50) |
-| RLVR training time | — | 124.7s (300 steps) |
+| Inference Mode | Accuracy | Description |
+|----------------|----------|-------------|
+| Eval A: `\|` blocked | 2.0% | `\|` logit set to -∞, model must answer directly |
+| Eval B: `\|` allowed | **20.5%** | Model decides whether to use scratchpad |
+| **Delta** | **+18.5%p** | Same model, same weights, only `\|` availability differs |
 
-**Pre-RLVR samples**: karan, anal, meeran, kana, linas, seane, maran, laelin, manah, alinie
+**Key observations:**
+- `|` usage rate: **99.5%** — the model almost always chose to use scratchpad
+- `|` usage during RLVR training: 56% → 92% (model learned to use it **more** over time)
+- Average scratchpad length: **1.2 tokens**
 
-**Post-RLVR samples**: dacha, adala, erisa, fanda, jarya, baria, karva, elisa, janza, jaxza
+**Post-hoc analysis within Eval B:**
 
-The model learns to consistently satisfy the verifiable constraint (5 chars + ends with 'a') while maintaining natural-sounding name structure from SFT.
+| Group | Accuracy | N |
+|-------|----------|---|
+| Samples with `\|` | 20.6% | 199 |
+| Samples without `\|` | 0.0% | 1 |
+
+**Example outputs:**
+```
+vi + l|an → "vian" ✓    (scratchpad: "l", answer: "an")
+el + l|an → "elan" ✓    (scratchpad: "l", answer: "an")
+yi + as|an → "yian" ✓   (scratchpad: "as", answer: "an")
+```
+
+### Interpretation
+
+Blocking the `|` token (same model, same weights) drops accuracy from 20.5% to 2.0%. The only variable is whether the model can use intermediate tokens before its final answer. This is a controlled ablation: no training differences, no architectural changes, just one token removed at inference time.
+
+The 1-2 scratchpad tokens provide extra forward passes through the attention mechanism. Each additional token adds computed context that subsequent tokens can attend to, effectively giving the model more "compute time" before committing to an answer. This is the same principle behind Chain-of-Thought at scale — more tokens = more sequential computation = better answers — observed here in a 5,952-parameter model.
 
 ## Usage
 
@@ -122,3 +145,4 @@ uv run python microgpt_rlvr.py       # MQA + MoE + RLVR
 - MQA: [Fast Transformer Decoding (Shazeer, 2019)](https://arxiv.org/abs/1911.02150)
 - MoE: [Outrageously Large Neural Networks (Shazeer et al., 2017)](https://arxiv.org/abs/1701.06538)
 - RLVR/GRPO: [DeepSeekMath (Shao et al., 2024)](https://arxiv.org/abs/2402.03300)
+- CoT emergence: [DeepSeek-R1 (Guo et al., 2025)](https://arxiv.org/abs/2501.12948)
