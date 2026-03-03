@@ -1,13 +1,17 @@
 """
-microGPT with MQA + MoE + RLVR — Scratchpad Ablation Test
+microGPT with MQA + MoE + RLVR — Scratchpad Content vs Compute Ablation
 
 Train ONE model: SFT → Cold Start → RLVR (scratchpad verifier)
-Evaluate SAME model with TWO inference modes:
+Evaluate SAME model with FOUR inference modes:
   Eval A: | token blocked (logit=-inf) → forced direct answer
   Eval B: natural generation → model decides whether to use |
-Plus post-hoc analysis: accuracy of |-using vs non-| samples within Eval B.
+  Eval C: forced random scratchpad (same token count, random content)
+  Eval D: model's scratchpad replaced with random (same length)
 
-If B > A → model productively uses scratchpad → micro-CoT evidence.
+Key comparisons:
+  B > A → scratchpad helps overall
+  B > C → model's content beats random → content matters (true CoT)
+  B ≈ C, C > A → any extra tokens help → just compute, not thinking
 """
 
 import os
@@ -209,17 +213,32 @@ def verifier(prompt_str, generated):
         return 0.0
     return 1.0 if (prompt_str + ''.join(uchars[t] for t in answer)) in name_set else 0.0
 
-def generate(prompt_str, temperature=1.0, collect_grad=True, block_sep=False):
-    """Generate from prompt. block_sep=True sets | logit to -inf."""
+def generate(prompt_str, temperature=1.0, collect_grad=True, block_sep=False, force_scratch=None):
+    """Generate from prompt.
+    block_sep=True: sets | logit to -inf (no scratchpad possible)
+    force_scratch: list of token ids to inject as scratchpad before |
+    """
     prompt_tokens = [BOS] + [uchars.index(ch) for ch in prompt_str]
+    # If forcing scratchpad, prepend it + SEP to generation plan
+    if force_scratch is not None:
+        inject = force_scratch + [SEP]
+    else:
+        inject = None
+
     keys_g, values_g = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
     generated, log_probs = [], []
+    inject_idx = 0
 
     token_id = prompt_tokens[0]
     for pos_id in range(block_size):
         logits = gpt(token_id, pos_id, keys_g, values_g)
         if pos_id < len(prompt_tokens) - 1:
             token_id = prompt_tokens[pos_id + 1]
+        elif inject is not None and inject_idx < len(inject):
+            # Force injected scratchpad tokens
+            token_id = inject[inject_idx]
+            inject_idx += 1
+            generated.append(token_id)
         else:
             adj_logits = [l / temperature for l in logits]
             if block_sep:
@@ -431,6 +450,54 @@ for ex in b_examples_miss[:3]:
 acc_with = b_with_sep_correct / b_with_sep_total * 100 if b_with_sep_total > 0 else 0
 acc_without = b_no_sep_correct / b_no_sep_total * 100 if b_no_sep_total > 0 else 0
 
+# --- Eval C: forced RANDOM scratchpad ---
+# Same number of extra tokens as Eval B, but random content.
+# If C ≈ B → extra tokens help (any content works, just more compute)
+# If B > C → model's chosen scratchpad is better than random → content matters
+avg_scratch_len = round(sum(b_scratch_lens)/len(b_scratch_lens)) if b_scratch_lens else 1
+print(f"\n[Eval C] Forced RANDOM scratchpad ({avg_scratch_len} random tokens + |)...")
+c_correct, c_total = 0, 0
+c_examples = []
+for pf in eval_prefixes:
+    rand_scratch = [random.randint(0, len(uchars)-1) for _ in range(avg_scratch_len)]
+    gen, _ = generate(pf, temperature=0.5, collect_grad=False, force_scratch=rand_scratch)
+    r = verifier(pf, gen)
+    c_total += 1
+    if r > 0:
+        c_correct += 1
+    if len(c_examples) < 10:
+        c_examples.append(f"  {pf}+{fmt(gen)} → {'✓' if r>0 else '✗'}")
+acc_c = c_correct / c_total * 100
+print(f"  Accuracy: {acc_c:.1f}% ({c_correct}/{c_total})")
+for ex in c_examples[:5]:
+    print(ex)
+
+# --- Eval D: model's scratchpad REPLACED with random ---
+# For each Eval B sample that used |, re-run with same-length random scratch.
+# This directly tests: does the specific content the model chose matter?
+print(f"\n[Eval D] Model scratchpad REPLACED with random (same length)...")
+d_correct, d_total = 0, 0
+d_examples = []
+for pf in eval_prefixes:
+    # First generate naturally to get model's scratch length
+    gen_natural, _ = generate(pf, temperature=0.5, collect_grad=False, block_sep=False)
+    if SEP in gen_natural:
+        s_len = gen_natural.index(SEP)
+        if s_len > 0:
+            # Replace with random scratch of same length
+            rand_scratch = [random.randint(0, len(uchars)-1) for _ in range(s_len)]
+            gen_replaced, _ = generate(pf, temperature=0.5, collect_grad=False, force_scratch=rand_scratch)
+            r = verifier(pf, gen_replaced)
+            d_total += 1
+            if r > 0:
+                d_correct += 1
+            if len(d_examples) < 10:
+                d_examples.append(f"  {pf}+{fmt(gen_natural)} → {pf}+{fmt(gen_replaced)} {'✓' if r>0 else '✗'}")
+acc_d = d_correct / d_total * 100 if d_total > 0 else 0
+print(f"  Accuracy: {acc_d:.1f}% ({d_correct}/{d_total})")
+for ex in d_examples[:5]:
+    print(ex)
+
 # ============================================================
 # FINAL RESULTS
 # ============================================================
@@ -439,40 +506,80 @@ print("FINAL RESULTS")
 print(f"{'='*60}")
 print(f"  Training: SFT(1000) → Cold Start(100) → RLVR(500)")
 print(f"  Task: 2-char prefix → real name ∈ dataset ({len(name_set)} names)")
+delta_ba = acc_b - acc_a
+delta_ca = acc_c - acc_a
+delta_da = acc_d - acc_a
 print()
-print(f"  ┌─────────────────────────────────────────────┐")
-print(f"  │ Ablation Test (same model, same prompts)    │")
-print(f"  │                                             │")
-print(f"  │  Eval A (| blocked):  {acc_a:5.1f}% accuracy       │")
-print(f"  │  Eval B (| allowed):  {acc_b:5.1f}% accuracy       │")
-delta = acc_b - acc_a
-sign = '+' if delta >= 0 else ''
-print(f"  │  Delta:              {sign}{delta:5.1f}%p              │")
-print(f"  │                                             │")
-print(f"  │ Post-hoc (within Eval B):                   │")
-print(f"  │  With |:    {acc_with:5.1f}% ({b_with_sep_correct}/{b_with_sep_total} samples)          │")
-print(f"  │  Without |: {acc_without:5.1f}% ({b_no_sep_correct}/{b_no_sep_total} samples)          │")
-print(f"  │  | usage:   {sep_rate:5.1f}%                        │")
-print(f"  └─────────────────────────────────────────────┘")
+print(f"  ┌───────────────────────────────────────────────────────┐")
+print(f"  │ Scratchpad Content vs Compute Ablation                │")
+print(f"  │                                                       │")
+print(f"  │  Eval A: | blocked            {acc_a:5.1f}% (baseline)      │")
+print(f"  │  Eval B: | allowed (natural)  {acc_b:5.1f}% ({delta_ba:+.1f}%p)         │")
+print(f"  │  Eval C: forced random scratch {acc_c:5.1f}% ({delta_ca:+.1f}%p)         │")
+print(f"  │  Eval D: model→random replace  {acc_d:5.1f}% ({delta_da:+.1f}%p)         │")
+print(f"  │                                                       │")
+print(f"  │ Key comparisons:                                      │")
+print(f"  │  B vs A: {delta_ba:+.1f}%p  (scratchpad helps?)               │")
+print(f"  │  B vs C: {acc_b-acc_c:+.1f}%p  (model > random content?)       │")
+print(f"  │  B vs D: {acc_b-acc_d:+.1f}%p  (content matters?)              │")
+print(f"  │  C vs A: {delta_ca:+.1f}%p  (any extra tokens help?)          │")
+print(f"  │                                                       │")
+print(f"  │ Post-hoc (within Eval B):                             │")
+print(f"  │  With |:    {acc_with:5.1f}% ({b_with_sep_correct}/{b_with_sep_total} samples)                    │")
+print(f"  │  Without |: {acc_without:5.1f}% ({b_no_sep_correct}/{b_no_sep_total} samples)                    │")
+print(f"  │  | usage:   {sep_rate:5.1f}%                                  │")
+if b_scratch_lens:
+    avg_sl = sum(b_scratch_lens)/len(b_scratch_lens)
+    print(f"  │  Avg scratch len: {avg_sl:.1f} tokens                        │")
+print(f"  └───────────────────────────────────────────────────────┘")
 print()
-if delta > 3:
-    print(f"  ✓ Removing | drops accuracy by {abs(delta):.1f}%p")
-    print(f"    → Model was using scratchpad productively")
-    if b_with_sep_total > 5 and acc_with > acc_without + 5:
-        print(f"  ✓ |-using samples ({acc_with:.0f}%) outperform non-| ({acc_without:.0f}%)")
-        print(f"    → Scratchpad usage correlates with correctness")
-        print(f"  ✓ CONCLUSION: Evidence of learned intermediate computation")
-    elif b_with_sep_total > 5:
-        print(f"  △ |-using ({acc_with:.0f}%) vs non-| ({acc_without:.0f}%) — mixed signal")
-    else:
-        print(f"  △ Too few | samples ({b_with_sep_total}) for post-hoc analysis")
-elif delta < -3:
-    print(f"  ✗ | hurts accuracy by {abs(delta):.1f}%p — scratchpad is harmful")
+
+# Interpretation
+print("  INTERPRETATION:")
+if delta_ba > 3:
+    print(f"  ✓ B > A by {delta_ba:.1f}%p → scratchpad helps overall")
 else:
-    print(f"  ─ No significant difference ({delta:+.1f}%p)")
-    if b_with_sep_total > 5 and acc_with > acc_without + 10:
-        print(f"  △ But within Eval B, |-users ({acc_with:.0f}%) > non-users ({acc_without:.0f}%)")
-        print(f"    → Model may benefit from | on certain prompts")
+    print(f"  ─ B ≈ A ({delta_ba:+.1f}%p) → scratchpad doesn't clearly help")
+
+if acc_b > acc_c + 3:
+    print(f"  ✓ B > C by {acc_b-acc_c:.1f}%p → model's chosen content > random")
+    print(f"    → Content matters, not just extra compute")
+elif acc_c > acc_b + 3:
+    print(f"  ✗ C > B by {acc_c-acc_b:.1f}%p → random scratch beats model's choice")
+    print(f"    → Model's scratchpad content may be counterproductive")
+else:
+    print(f"  △ B ≈ C ({acc_b-acc_c:+.1f}%p) → content doesn't matter much")
+    if delta_ca > 3:
+        print(f"    But C > A by {delta_ca:.1f}%p → any extra tokens help")
+        print(f"    → It's about extra compute (forward passes), not 'thinking'")
+    else:
+        print(f"    And C ≈ A ({delta_ca:+.1f}%p) → extra tokens don't help either")
+
+if d_total > 10:
+    if acc_b > acc_d + 3:
+        print(f"  ✓ B > D by {acc_b-acc_d:.1f}%p → replacing model's scratch hurts accuracy")
+        print(f"    → Model learned meaningful intermediate representations")
+    elif abs(acc_b - acc_d) <= 3:
+        print(f"  △ B ≈ D ({acc_b-acc_d:+.1f}%p) → replacing scratch doesn't matter")
+        print(f"    → Scratchpad content is interchangeable")
+else:
+    print(f"  △ Eval D: only {d_total} samples — not enough for conclusion")
+
+# Overall conclusion
+print()
+if delta_ba > 3 and acc_b > acc_c + 3:
+    print(f"  CONCLUSION: Scratchpad provides CONTENT-dependent benefit.")
+    print(f"  The model learned to use intermediate tokens meaningfully,")
+    print(f"  beyond just extra compute. Evidence of micro-CoT.")
+elif delta_ba > 3 and abs(acc_b - acc_c) <= 3 and delta_ca > 3:
+    print(f"  CONCLUSION: Scratchpad helps via EXTRA COMPUTE, not content.")
+    print(f"  Any additional tokens (even random) provide benefit through")
+    print(f"  extra forward passes. Not true 'thinking', but compute gain.")
+elif delta_ba > 3:
+    print(f"  CONCLUSION: Scratchpad helps, but mechanism is unclear.")
+    print(f"  Need more samples or analysis to distinguish content vs compute.")
+else:
+    print(f"  CONCLUSION: No clear scratchpad benefit observed.")
 
 # | usage trend during RLVR
 early = sum(sep_hist[:50])/50

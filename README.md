@@ -95,40 +95,51 @@ All models trained on the [names dataset](https://github.com/karpathy/makemore) 
 
 **MoE**: karan, meeran, kana, seane, maran, laelin, alenan, dane, arel, ladid
 
-### RLVR Scratchpad Ablation Test
+### RLVR Scratchpad: Content vs Compute Ablation
 
-**Experiment:** Train ONE model (SFT → Cold Start → RLVR), then evaluate with two inference modes on the same 200 prompts:
+The central question: does a scratchpad help because the model **thinks** (content matters), or because it gets **extra forward passes** (any tokens help)?
 
-| Inference Mode | Accuracy | Description |
-|----------------|----------|-------------|
-| Eval A: `\|` blocked | 2.0% | `\|` logit set to -∞, model must answer directly |
-| Eval B: `\|` allowed | **20.5%** | Model decides whether to use scratchpad |
-| **Delta** | **+18.5%p** | Same model, same weights, only `\|` availability differs |
+**Experiment:** Train ONE model (SFT → Cold Start → RLVR), then evaluate with FOUR inference modes on the same 200 prompts:
 
-**Key observations:**
+| Eval | Mode | Accuracy | vs Baseline |
+|------|------|----------|-------------|
+| A | `\|` blocked (baseline) | 0.5% | — |
+| B | `\|` allowed (natural) | **11.0%** | **+10.5%p** |
+| C | Forced random scratchpad | 10.5% | +10.0%p |
+| D | Model's scratchpad → random | 12.8% | +12.3%p |
+
+**Key comparisons:**
+
+| Comparison | Delta | Interpretation |
+|------------|-------|----------------|
+| B vs A | +10.5%p | Scratchpad helps overall |
+| B vs C | +0.5%p | Model's content ≈ random content |
+| B vs D | -1.8%p | Replacing model's scratch doesn't hurt |
+| C vs A | +10.0%p | Random tokens also help just as much |
+
+**Observations:**
 - `|` usage rate: **99.5%** — the model almost always chose to use scratchpad
-- `|` usage during RLVR training: 56% → 92% (model learned to use it **more** over time)
-- Average scratchpad length: **1.2 tokens**
-
-**Post-hoc analysis within Eval B:**
-
-| Group | Accuracy | N |
-|-------|----------|---|
-| Samples with `\|` | 20.6% | 199 |
-| Samples without `\|` | 0.0% | 1 |
+- `|` usage during RLVR training: 54% → 74% (model learned to use it **more** over time)
+- Average scratchpad length: **1.0 tokens**
 
 **Example outputs:**
 ```
-vi + l|an → "vian" ✓    (scratchpad: "l", answer: "an")
-el + l|an → "elan" ✓    (scratchpad: "l", answer: "an")
-yi + as|an → "yian" ✓   (scratchpad: "as", answer: "an")
+tu + r|la → "turla" ✓    (scratchpad: "r", answer: "la")
+ab + y|y  → "aby"   ✓    (scratchpad: "y", answer: "y")
+lo + r|la → "lorla" ✓    (scratchpad: "r", answer: "la")
 ```
 
 ### Interpretation
 
-Blocking the `|` token (same model, same weights) drops accuracy from 20.5% to 2.0%. The only variable is whether the model can use intermediate tokens before its final answer. This is a controlled ablation: no training differences, no architectural changes, just one token removed at inference time.
+The 4-way ablation reveals that the scratchpad benefit is **compute-driven, not content-driven**:
 
-The 1-2 scratchpad tokens provide extra forward passes through the attention mechanism. Each additional token adds computed context that subsequent tokens can attend to, effectively giving the model more "compute time" before committing to an answer. This is the same principle behind Chain-of-Thought at scale — more tokens = more sequential computation = better answers — observed here in a 5,952-parameter model.
+1. **Scratchpad helps** (B > A by +10.5%p): Blocking `|` at inference drops accuracy from 11% to 0.5%. The model clearly depends on the scratchpad mechanism.
+
+2. **Content doesn't matter** (B ≈ C ≈ D): Random scratchpad tokens perform equally well (10.5%) as the model's own chosen tokens (11.0%). Replacing the model's scratchpad with random content (Eval D: 12.8%) doesn't hurt — it even slightly helps.
+
+3. **It's extra compute**: Each additional token provides an extra forward pass through the attention mechanism. Subsequent tokens can attend to the computed hidden state of the scratchpad token, giving the model more sequential computation before committing to an answer. The content of that computation doesn't matter — just having *any* token there creates a richer attention context.
+
+This is the same principle behind Chain-of-Thought at scale (more tokens = more sequential computation = better answers), but at this 5,952-parameter scale, we can prove it's a **compute effect** rather than **emergent reasoning**. The model learned to use `|` as a "compute buffer" — not to think, but to buy itself an extra forward pass. True content-dependent reasoning likely requires more model capacity.
 
 ## Usage
 
