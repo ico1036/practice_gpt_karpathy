@@ -1,0 +1,6 @@
+[project]
+name = "practice-gpt-karpathy"
+version = "0.1.0"
+description = "Experimental variants of Karpathy's microGPT (MHA, MQA, MoE, RLVR)"
+requires-python = ">=3.10"
+dependencies = []
